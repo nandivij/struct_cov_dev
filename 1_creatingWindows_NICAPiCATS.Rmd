@@ -1,0 +1,301 @@
+---
+title: "creatingWindows_NICAPiCATS"
+author: "Nandi"
+date: "26 July 2019"
+output: html_document
+---
+
+###LOAD PACKAGES AND SET DIRECTORIES
+```{r}
+packages <- c("nlme", "ggplot2", "tidyr", "knitr",
+                "data.table", "lubridate", "readxl", "matrixStats", "gridExtra","grid", "dplyr","lme4","VIM","mgcv","itsadug","rJava","mgcv","itsadug","ggplot2","stringr", "knitr","corrplot","gridExtra", "psych","kableExtra","dplyr","foreign","MASS")
+
+if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(packages, rownames(installed.packages())))  
+}
+
+lapply(packages, library, character.only = TRUE)
+
+select <- dplyr::select
+separate <- tidyr::separate
+
+get_legend<-function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+scaleFUN <- function(x) sprintf("%.0f", x)
+
+datadir <- '/Volumes/rds/RDS27534-NICAP/behaviour/'
+outdir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/nandi/sMRI/age_structcov/age_windows/'
+nicap_dir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/freesurfer_hires/parcellations/'
+icats_dir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/freesurfer_hires_iCATS/parcellations/' 
+```
+
+###IMPORT DEMO 
+```{r}
+demo <- read.csv(paste0(datadir,'demo_icats_nicap/list_icats_nicap.csv'),header=T)
+```
+
+###IMPORT LONG FORMAT DEMO & COMBINE STUDIES
+```{r}
+iCATS = read.spss(paste0(datadir,'iCATS/iCATS_db.sav'), to.data.frame=TRUE)
+
+iCATS <- iCATS %>% select(CATS_ID,C_Gender,Age_years_RCH_1,Age_years_RCH_2,Tanner_stage_W1,Tanner_stage_W2) %>%
+  rename(SID = CATS_ID,
+         gender = C_Gender,
+         age_wave1 = Age_years_RCH_1,
+         age_wave2 = Age_years_RCH_2,
+         pbip_wave1 = Tanner_stage_W1,
+         pbip_wave2 = Tanner_stage_W2) %>%
+  mutate(study = "iCATS")
+
+data <- iCATS %>% gather(variable,value,-SID,-gender,-study) %>%
+  separate(variable,into=c("variable","wave")) %>%
+  spread(variable,value) %>%
+  mutate(gender = ifelse(gender==0,"Male",
+                          ifelse(gender==1,"Female",NA))) %>%
+  filter(age < 50) %>%
+  arrange(age) %>%
+  mutate(SID = factor(SID, unique(SID)))
+
+NICAP = read.csv(paste0(datadir,'puberty_long.csv'))
+
+NICAP <- NICAP %>% filter(controls==1) %>%
+  mutate(study = "NICAP") %>%
+  select(SID, gender, study, wave, age, pbip, pdss) %>%
+  mutate(SID = as.factor(SID))
+
+NICAP <- NICAP %>% select(-pdss) %>%
+  mutate(pbip = ceiling(pbip))
+
+data <- data %>% rbind(.,NICAP) %>%
+  mutate(gender = as.factor(gender),
+         study = as.factor(study)) %>%
+  arrange(age) %>%
+  mutate(SID = factor(SID, unique(SID))) %>%
+  mutate(ID = paste0(SID,'_',wave))
+```
+
+###COMPARE SES PERCENTILES
+```{r}
+iCATS_ses <- read_excel(paste0(datadir,'iCATS/cats_data_P0008_20151209_wSA1SEIFA.xls'),sheet=1)
+iCATS_ses <- iCATS_ses %>% select(uniqueid,IRSAD_Perc_Aust) %>% 
+  mutate(SID = as.factor(uniqueid), study = "iCATS", IRSAD_perc = IRSAD_Perc_Aust) %>% select(SID, study, IRSAD_perc) %>% filter(SID %in% demo$SID)
+
+NICAP_ses <- read_excel(paste0(datadir,'nandi_variables.xlsx'),sheet=1) #will need to update with correct df
+NICAP_ses <- NICAP_ses %>% select(id_number,p3_IRSADDecile) %>% mutate(SID = as.factor(id_number), study = "NICAP", IRSAD_perc = p3_IRSADDecile) %>% select(SID, study, IRSAD_perc) %>% filter(SID %in% demo$SID)
+
+ses <- iCATS_ses %>% rbind(NICAP_ses) %>% mutate(study = as.factor(study))
+
+t.test(IRSAD_perc ~ study, data = ses)
+```
+
+###IMPORT BRAIN LIST AND REMOVE SUBJECTS FROM DEMO WITH MISSING DATA
+```{r}
+nicap_brain <- read.csv(paste0(datadir,"demo_icats_nicap/nicap_controls.csv"), header = T)
+icats_brain <- read.csv(paste0(datadir,"demo_icats_nicap/icats.csv"), header = T)
+
+nicap_brain <- nicap_brain %>% select(SID,wave) %>%
+  mutate(SID = as.factor(as.numeric(SID)),
+         wave = as.factor(wave))
+icats_brain <- icats_brain %>% select(SID,wave) %>%
+  mutate(SID = as.factor(SID),
+         wave = as.factor(wave))
+
+brain <- nicap_brain %>% rbind(icats_brain) %>%
+  mutate(ID = paste0(SID,'_',wave)) 
+
+demo <- demo %>% select(SID,irsad,mr_ts)
+data <- data %>% left_join(.,demo) %>% filter(ID %in% brain$ID)
+write.csv(data,paste0(datadir,'demo_icats_nicap/data_icats_nicap.csv'),row.names=F)
+```
+
+###CREATING WINDOWS BASED ON N - MORE OVERLAP
+```{r}
+windows = c(70,70,70,80,80,80,90,90,90)
+overlaps = c(0.2,0.25,0.3,0.2,0.25,0.3,0.2,0.25,0.3) #how many ppl to move up with each window
+
+indices <- as.list(paste0(windows,'_',overlaps))
+
+out <- lapply(indices, b=data, function(a, b) {
+
+adf = b
+window = as.numeric(unlist(strsplit(as.character(a),'_'))[1])
+overlap = ceiling(window - (as.numeric(unlist(strsplit(as.character(a),'_'))[2]) * window))
+diff = window - overlap
+
+x=0
+y=window
+saved <- list()
+i <- 1
+while (x < (nrow(adf) - overlap)) {
+  saved[[i]] <- paste0(x,'_',y)
+  i <- i + 1
+  x=x+diff
+  y=y+diff
+}
+
+bins <- data.table(saved) %>% 
+  separate(saved, into=c("start","end"))
+bin_num = nrow(bins)
+print(bin_num)
+
+mod <- lapply(1:bin_num, x=window, y=overlap, df=adf,  function(i, x, y, df) {
+  
+  var=paste0('bin_',i)
+  start=as.numeric(bins[i]$start)
+  end=as.numeric(bins[i]$end)
+  print(var)
+  print(start)
+  print(end)
+  
+  if (i==bin_num) {
+    
+    binned_df <- df %>% arrange(age) %>%
+    mutate(num = row_number()) %>%
+    mutate(value = ifelse(num > start,1,0),
+             bin = var) 
+    
+    #identify duplicated IDs in a bin and remove then.
+    id_summary <- binned_df %>% filter(value==1) %>% group_by(SID) %>% summarise(N=n()) %>% filter(N > 1)
+
+    remove_id <- binned_df %>% filter(SID %in% id_summary$SID) %>%
+      mutate(agediff = abs(age - median(subset(binned_df,binned_df$value==1)$age))) %>% 
+      group_by(SID) %>% arrange(agediff) %>% filter(!row_number()==1) %>% select(-agediff)
+
+    binned_df <- anti_join(binned_df, remove_id)
+      
+    } else {
+      
+      binned_df <- df %>% arrange(age) %>%
+      mutate(num = row_number()) %>%
+      mutate(value = ifelse(num > start & num <= end,1,0),
+             bin = var) 
+      
+      #identify duplicated IDs in a bin and remove then.
+      while(nrow(binned_df %>% filter(value==1) %>% group_by(SID) %>% summarise(N=n()) %>% filter(N > 1)) > 0) {
+        
+        id_summary <- binned_df %>% filter(value==1) %>% group_by(SID) %>% summarise(N=n()) %>% filter(N > 1)
+
+        remove_id <- binned_df %>% filter(SID %in% id_summary$SID) %>%
+          mutate(agediff = abs(age - median(subset(binned_df,binned_df$value==1)$age))) %>% 
+          group_by(SID) %>% arrange(agediff) %>% filter(!row_number()==1) %>% select(-agediff)
+        
+        binned_df <- anti_join(binned_df, remove_id) %>% mutate(num = row_number()) %>%
+          mutate(value = ifelse(num > start & num <= end,1,0))
+        
+      } }
+  binned_df
+})
+
+binned_df <- rbindlist(mod) %>% select(SID,study,wave,gender,age,bin,value) %>%
+  mutate(agebin = as.factor(gsub("bin_","",bin))) %>% filter(!value==0)
+sortedbins <- paste(sort(as.integer(levels(binned_df$agebin))))
+binned_df$agebin <- factor(binned_df$agebin, levels = sortedbins)
+
+#save plot
+bins_plot <- ggplot(binned_df,aes(x=age,y=agebin)) + geom_jitter(aes(color=study),width = 0.05, height = 0.1)
+ggsave(filename=paste0(outdir,'Nbin_w',window,'_o',overlap,'.jpg'),
+       plot=bins_plot,
+       width=8,
+       height=6)
+
+bins_plot_paper <- ggplot(binned_df,aes(x=age,y=agebin)) + geom_jitter(colour="steelblue",width = 0.05, height = 0.1) +
+  theme_minimal(base_size = 24, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  legend.position="right") +
+  ylab("Bins") +
+  xlab("Age")
+ggsave(filename=paste0(outdir,'Nbin_w',window,'_o',overlap,'_paper.jpg'),
+       plot=bins_plot_paper,
+       width=5,
+       height=5)
+
+bins_plot_study_paper <- ggplot(binned_df,aes(x=age,y=agebin)) + geom_jitter(aes(colour=study),width = 0.05, height = 0.1) +
+  theme_minimal(base_size = 24, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  legend.position="right") +
+  ylab("Bins") +
+  xlab("Age") + 
+  labs(colour="Study")
+ggsave(filename=paste0(outdir,'Nbin_w',window,'_o',overlap,'_study_paper.jpg'),
+       plot=bins_plot_study_paper,
+       width=6.5,
+       height=5)
+
+bins_plot_sex_paper <- ggplot(binned_df,aes(x=age,y=agebin)) + geom_jitter(aes(colour=gender),width = 0.05, height = 0.1) +
+  theme_minimal(base_size = 24, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  legend.position="right") +
+  ylab("Bins") +
+  xlab("Age") + 
+  labs(colour="Sex") +
+  scale_color_manual(values=c("#9999FF","#FF9900")) + 
+  scale_x_continuous(breaks = seq(9,14,by=1)) +
+  guides(colour=guide_legend(override.aes = list(size=4)))
+
+ggsave(filename=paste0(outdir,'Nbin_w',window,'_o',overlap,'_sex_paper.jpg'),
+       plot=bins_plot_sex_paper,
+       width=6.5,
+       height=5)
+
+bins_plot_sex_paper2 <- ggplot(binned_df,aes(x=age,y=agebin)) + geom_jitter(aes(colour=gender),width = 0.05, height = 0.1) +
+  theme_minimal(base_size = 24, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  legend.position="none") +
+  ylab("Bins") +
+  xlab("Age") + 
+  labs(colour="Sex") +
+  facet_wrap(~gender) +
+  scale_color_manual(values=c("#9999FF","#FF9900"))
+
+ggsave(filename=paste0(outdir,'Nbin_w',window,'_o',overlap,'_sex_paper2.jpg'),
+       plot=bins_plot_sex_paper2,
+       width=8,
+       height=5)
+
+#save summary
+bins_summary <- binned_df %>% 
+  group_by(agebin) %>%
+  summarise(N=n(),
+            ageMedian = median(age),
+            ageMin = min(age),
+            ageMax = max(age)) %>%
+  mutate(intervalMedian = ageMedian-lag(ageMedian))
+write.csv(bins_summary,paste0(outdir,'Nbin_w',window,'_o',overlap,'_summary.csv'),row.names=F)
+
+#save df with groupings
+write.csv(binned_df,paste0(outdir,'Nbin_w',window,'_o',overlap,'.csv'),row.names=F) 
+
+})
+
+#check there are no duplicated IDs in age bins
+for (i in 1:length(indices)) {
+  a = indices[i]
+  window = as.numeric(unlist(strsplit(as.character(a),'_'))[1])
+  overlap = ceiling(window - (as.numeric(unlist(strsplit(as.character(a),'_'))[2]) * window))
+  df <- read.csv(paste0(outdir,'Nbin_w',window,'_o',overlap,'.csv'))
+  df <- df %>% group_by(SID,agebin) %>% summarise(N=n()) %>% filter(N > 1)
+  if (nrow(df) > 0) {
+    print(a)
+    print(df$SID) }
+}
+```

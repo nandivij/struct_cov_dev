@@ -1,0 +1,342 @@
+---
+title: "structural_covariance"
+author: "Nandi"
+date: "25 July 2019"
+output: html_document
+---
+
+###LOAD PACKAGES AND SET DIRECTORIES
+```{r, include=FALSE}
+packages <- c("zoo", "tidyr","tibble","stringr","dplyr","ggplot2","parallel","lme4","data.table","RColorBrewer","tidyverse","cluster","factoextra","mgcv","itsadug","psych","parallel","gtools","gridExtra","R.matlab")
+if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(packages, rownames(installed.packages())))  
+}
+lapply(packages, library, character.only = TRUE)
+
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+select <- dplyr::select
+options(digits=3)
+scaleFUN <- function(x) sprintf("%.2f", x)
+  
+#set parcellations
+parc='HCP-MMP1'
+#set metric
+metrics=c('thickness')
+#lopp mclapply
+numcores <- detectCores()
+#upper triangular mask (for matrix averaging)
+triup = upper.tri(matrix(nrow=nroi,ncol=nroi))  
+#number of bootstraps
+nboot = 1000 
+
+#set pathways and load some data
+nicap_dir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/sMRI/freesurfer_hires/parcellations/'
+icats_dir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/sMRI/freesurfer_hires_iCATS/parcellations/'
+dfdir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/nandi/sMRI/age_structcov/'
+windir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/nandi/sMRI/age_structcov/age_windows/'
+demo <- read.csv('/Volumes/rds/RDS27534-NICAP/behaviour/demo_icats_nicap/data_icats_nicap.csv',header=T)
+demo <- demo %>% mutate(irsad = ifelse(is.na(irsad),1039,irsad))
+```
+
+###IMPORT PARCELLATION DATA
+```{r}
+lh_nicap <- read.table(paste0(nicap_dir,"lh_",parc,"_thickness.txt"), header = T)
+rh_nicap <- read.table(paste0(nicap_dir,"rh_",parc,"_thickness.txt"), header = T)
+lh_icats <- read.table(paste0(icats_dir,"lh_",parc,"_thickness.txt"), header = T)
+rh_icats <- read.table(paste0(icats_dir,"rh_",parc,"_thickness.txt"), header = T)
+
+lh_nicap <- lh_nicap %>%
+  rename(SID=1) %>%
+  separate(SID,into=c("sub","SID","wave","junk")) %>%
+  select(-sub,-junk) %>%
+  mutate(SID = as.factor(as.numeric(SID)),
+         wave = as.factor(wave))
+rh_nicap <- rh_nicap %>%
+  rename(SID=1) %>%
+  separate(SID,into=c("sub","SID","wave","junk")) %>%
+  select(-sub,-junk) %>%
+  mutate(SID = as.factor(as.numeric(SID)),
+         wave = as.factor(wave))
+lh_icats <- lh_icats %>%
+  rename(SID=1) %>%
+  separate(SID,into=c("sub","SID","junk","wave","junk2")) %>%
+  select(-sub,-junk,-junk2) %>%
+  mutate(SID = as.factor(SID),
+         wave = as.factor(wave))
+rh_icats <- rh_icats %>%
+  rename(SID=1) %>%
+  separate(SID,into=c("sub","SID","junk","wave","junk2")) %>%
+  select(-sub,-junk,-junk2) %>%
+  mutate(SID = as.factor(SID),
+         wave = as.factor(wave))
+nicap <- lh_nicap %>% full_join(.,rh_nicap) 
+icats <- lh_icats %>% full_join(.,rh_icats) 
+
+if (parc == "DKT") {
+  icats <- icats %>% select(-rh_temporalpole_thickness)
+}
+
+#combine data and save
+data <- nicap %>% rbind(icats) %>%
+  mutate(ID = paste0(SID,'_',wave)) %>%
+  filter(ID %in% demo$ID) %>% 
+  left_join(.,demo) %>%
+  mutate(gender = as.factor(gender),
+         study = as.factor(study))
+length(unique(data$SID))
+summary(as.factor(data$study))
+summary(data$gender)
+
+write.csv(data,paste0(dfdir,parc,'_data.csv'),row.names=F)
+```
+
+#LIST REGIONS TO LOOP THROUGH
+```{r}
+if (parc == "HCP-MMP1") {
+  nroi = 360
+  regions <- grep("thickness",names(data), value=T)
+  remove <- c("lh_..._thickness","rh_..._thickness")
+  regions <- regions[!regions %in% remove]
+}
+
+if (parc == "DKT") {
+  nroi = 62
+  regions <- grep("thickness",names(data), value=T)
+  remove <- c("rh_MeanThickness_thickness","lh_MeanThickness_thickness")
+  regions <- regions[!regions %in% remove]
+}
+
+write.csv(regions,paste0("/Volumes/rds/RDS27534-NICAP/code/sMRI/structcov/map_modules/",parc,"_nodes_sc.csv"))
+```
+
+###REGRESS OUT STUDY AND SEX
+```{r}
+data_long <- data %>% 
+  gather(variable,value,-SID,-ID,-study,-wave,-gender,-age,-pbip,-irsad,-mr_ts) %>%
+  mutate(scanner = ifelse(study == "NICAP" & wave == "wave3", "post", "pre")) %>%
+  mutate(scanner = as.factor(scanner))
+
+#Check whether I should regress out confounds? 
+mod <- lapply(regions,df=data_long,function(roi,df){
+      adf <- df %>% filter(variable==roi) %>%
+        mutate(value = as.numeric(value),
+               irsad = scale(irsad))
+      m <- lm(value ~ gender + scanner + study, data = adf)
+      adf_sum <- as.data.frame(summary(m)$coefficients) %>% mutate(roi = roi) %>%
+          mutate(effect = c("Intercept","Gender","Scanner","Study"))
+      adf_sum })
+summ_mods <- rbindlist(mod)
+
+#fdr correction of pvals of the models above, and save output and figures
+cc <- scales::seq_gradient_pal("red", "yellow")(seq(0,1,length.out=11))
+
+#plot cohort (study) differences across regions
+summ_study <- summ_mods %>% filter(effect=="Study") %>%
+  mutate(fdr = p.adjust(`Pr(>|t|)`,method="fdr",n = length(`Pr(>|t|)`))) %>%
+  mutate(fdr_cut = cut(fdr, breaks=c(0,0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0),
+                           levels=c("<0.05", "<0.1", "<0.2", "<0.3", "<0.4",
+                                    "<0.5","<0.6","<0.7","<0.8","<0.9","<1.0")))
+study_plot <- ggplot(summ_study, aes(x=Estimate)) + geom_histogram(aes(fill=fdr_cut),alpha=0.6) +
+  scale_fill_manual(values=cc,labels = c("0.05", "0.1", "0.2", "0.3", "0.4",
+                                    "0.5","0.6","0.7","0.8","0.9","1.0"),
+                        name = "p.fdr", drop = FALSE) +
+  xlab("Estimate")+
+  ylab("Count")+
+  theme_bw() +
+  theme_minimal(base_size = 16, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_blank(),
+             panel.background = element_blank(),
+             legend.position="right")
+ggsave(filename=paste0(dfdir,parc,'_study.jpg'), plot=study_plot,width=6,height=5)
+write.csv(summ_study,paste0(dfdir,parc,'_summary_study.csv'),row.names=F)
+
+#plot scanner differences across regions
+summ_scanner <- summ_mods %>% filter(effect=="Scanner") %>%
+  mutate(fdr = p.adjust(`Pr(>|t|)`,method="fdr",n = length(`Pr(>|t|)`))) %>%
+      mutate(fdr_cut = cut(fdr, breaks=c(0,0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0),
+                           levels=c("<0.05", "<0.1", "<0.2", "<0.3", "<0.4", 
+                                    "<0.5","<0.6","<0.7","<0.8","<0.9","<1.0")))
+
+scanner_plot <- ggplot(summ_scanner, aes(x=Estimate)) + geom_histogram(aes(fill=fdr_cut),alpha=0.6) +
+  scale_fill_manual(values=cc,labels = c("0.05", "0.1", "0.2", "0.3", "0.4", 
+                                    "0.5","0.6","0.7","0.8","0.9","1.0"), 
+                        name = "p.fdr", drop = FALSE) +
+  xlab("Estimate")+  
+  ylab("Count")+
+  theme_bw() +
+  theme_minimal(base_size = 16, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_blank(),
+             panel.background = element_blank(),
+             legend.position="right")
+ggsave(filename=paste0(dfdir,parc,'_scanner.jpg'), plot=scanner_plot,width=6,height=5)
+write.csv(summ_scanner,paste0(dfdir,parc,'_summary_scanner.csv'),row.names=F)   
+
+#plot gender differences across regions
+summ_gender <- summ_mods %>% filter(effect=="Gender") %>%
+  mutate(fdr = p.adjust(`Pr(>|t|)`,method="fdr",n = length(`Pr(>|t|)`))) %>%
+  mutate(fdr_cut = cut(fdr, breaks=c(0,0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0),
+                           levels=c("<0.05", "<0.1", "<0.2", "<0.3", "<0.4", 
+                                    "<0.5","<0.6","<0.7","<0.8","<0.9","<1.0")))
+
+gender_plot <- ggplot(summ_gender, aes(x=Estimate)) + geom_histogram(aes(fill=fdr_cut),alpha=0.6) +
+  scale_fill_manual(values=cc,labels = c("0.05", "0.1", "0.2", "0.3", "0.4", 
+                                    "0.5","0.6","0.7","0.8","0.9","1.0"), 
+                        name = "p.fdr", drop = FALSE) +
+  xlab("Estimate")+  
+  ylab("Count")+
+  theme_bw() +
+  theme_minimal(base_size = 16, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_blank(),
+             panel.background = element_blank(),
+             legend.position="right")
+ggsave(filename=paste0(dfdir,parc,'_gender.jpg'), plot=gender_plot,width=6,height=5)
+write.csv(summ_gender,paste0(dfdir,parc,'_summary_gender.csv'),row.names=F)   
+
+#run same model as above (controlling for), but now save residuals
+mods <- lapply(regions,df=data_long,function(roi,df){
+  adf <- df %>% filter(variable==roi) %>% 
+    mutate(value = as.numeric(value),
+           irsad = scale(irsad))
+  m <- lm(value ~ gender + scanner + study, data = adf)
+  adf$resid <- resid(m)
+  adf$zresid <- rstandard(m)
+  adf })   
+
+data_res <- rbindlist(mods) %>% select(-value,-resid) %>% 
+  spread(variable, zresid) 
+write.csv(data_res,paste0(dfdir,parc,'_data_contSexScannerStudy.csv'))
+```
+
+###CREATE SC MATRICES PER BIN
+```{r}
+dfs <- list.files(paste0(windir),pattern="*bin.*\\.csv$",full.names=F)
+dfs <- dfs[!grepl("summary",dfs)]
+
+for (x in 1:length(dfs)) {  
+  y = dfs[x]
+  df <- read.csv(paste0(windir,y))
+  df$bin <- factor(df$bin, levels=mixedsort(levels(as.factor(df$bin))))
+  bins <- mixedsort(levels(as.factor(df$bin))) 
+  outdf <- paste0(windir,y,"_",parc)
+  outdf <- gsub(".csv","",outdf)
+  dir.create(file.path(outdf))
+  
+  summary <- df %>% group_by(bin,study,gender) %>%
+    summarise(N=n(),
+              Age_median=round(median(age),2),
+              Age_mean=round(mean(age),2),
+              Age_sd=round(sd(age),2)) 
+  summary$bin <- factor(summary$bin, levels=mixedsort(levels(as.factor(summary$bin))))
+  summary <- summary %>% arrange(bin)
+  write.csv(summary, paste0(outdf,'/summary_bins.csv'),row.names=F)
+  
+  tbl = table(df$bin,df$gender)
+  tbl
+  out <- as.data.frame(cbind(chisq.test(tbl)$statistic,chisq.test(tbl)$parameter,chisq.test(tbl)$p.value)) %>%
+    rename(Chi = V1, df = V2, p = V3)
+  write.csv(out, paste0(outdf,'/gender_chi.csv'),row.names=F)
+  
+  tbl = table(df$bin,df$study)
+  tbl
+  out <- as.data.frame(cbind(chisq.test(tbl)$statistic,chisq.test(tbl)$parameter,chisq.test(tbl)$p.value)) %>%
+    rename(Chi = V1, df = V2, p = V3)
+  write.csv(out, paste0(outdf,'/study_chi.csv'),row.names=F)
+  
+  median_age <- df %>% group_by(bin) %>%
+    summarise(age_median = median(age))
+  df <- df %>% left_join(., median_age) %>% mutate(age_median = as.factor(round(age_median,1)))
+  median_age <- as.vector(sprintf(median_age$age_median, fmt = '%#.1f'))
+  
+  sample_hist <- ggplot(df, aes(x=age_median)) + geom_bar(aes(fill=study)) +
+    scale_x_discrete(labels=c(median_age),name="Age Bins") + 
+    scale_fill_discrete(name="Sample") +
+    ylab("")+
+      theme_bw() +
+      theme_minimal(base_size = 10, base_family = "Arial") +
+      theme(axis.line = element_line(colour = "black"),
+            axis.text.x = element_text(angle=45,hjust = 1),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_blank(),
+             panel.background = element_blank())
+  
+  gender_hist <- ggplot(df, aes(x=age_median)) + geom_bar(aes(fill=gender)) +
+    scale_x_discrete(labels=c(median_age),name="Age Bins") + 
+    scale_fill_discrete(name="Sex") +
+    ylab("")+
+      theme_bw() +
+      theme_minimal(base_size = 10, base_family = "Arial") +
+      theme(axis.line = element_line(colour = "black"),
+            axis.text.x = element_text(angle=45,hjust = 1),
+             panel.grid.major = element_blank(),
+             panel.grid.minor = element_blank(),
+             panel.border = element_blank(),
+             panel.background = element_blank())
+  
+  ggsave(filename=paste0(outdf,'/sample_hist.jpg'), plot=sample_hist,width=4,height=3)
+  ggsave(filename=paste0(outdf,'/gender_hist.jpg'), plot=gender_hist,width=4,height=3)
+  
+  for (i in 1:length(bins)) {
+    j = bins[i]
+    bin <- df %>% filter(bin==j)
+    ids <- bin$SID 
+    ns = length(ids)
+    age <- median(bin$age)
+    ct <- bin %>% left_join(., data_res) %>%
+      select(regions) #standardised residuals, controlling for sex, study, scanner
+    sc <- cor(ct,use="pairwise.complete.obs")
+    sc_df <- as.data.frame(sc) %>% mutate(bin=j, age=age)    
+    write.csv(sc_df,paste0(outdf,'/',j,'.csv'))
+    
+    #bootstrap matrices 
+    sc.boot = array(NA,dim=c(nroi,nroi,nboot)) 
+    for (n in 1:nboot) {
+      boot.id = sample(1:ns,size=ns,replace=T)  #sample parts w/ replacement
+      sc.boot[,,n] = cor(ct[boot.id,],use="pairwise.complete.obs") #bootstrapped sc
+      }
+    boot.p = 1-sign(sc)*(apply(sign(sc.boot),c(1,2),sum)/nboot) #bootstrap p-value - what proportion of bootstrap signs are inconsistent with empirical value? ###NOTE - THIS WAS CHANGED. OLD: boot.p = 1-sign(sc)*abs(apply(sign(sc.boot),c(1,2),sum)/nboot)
+    boot.p.fdr = matrix(p.adjust(boot.p, method = "fdr"),nrow=nroi,byrow=T) #FDR correct p-values
+    sc.thr = array(NA,dim=c(nroi,nroi)) #initialise thresholded matrix
+    sc.thr[boot.p.fdr<0.05] = sc[boot.p.fdr<0.05] #set alpha; here FDR = 0.05
+    sc.thr[as.logical(diag(nroi))] = NA; #set diagonal to NA (self-correlations to be ignored)
+    
+    #density
+    d = sum(!is.na(sc.thr[triup]))/((nroi*(nroi-1))/2) # edge density of age-invariant network
+    
+    #check for negative correlations and make them 0
+    neg <- sum(sc.thr<0,na.rm=T)/2 
+    write.csv(neg,paste0(outdf,'/',j,"_neg.csv"),row.names=F)
+    sc.thr[sc.thr<0] = 0
+    
+    #check density again
+    d = sum(!is.na(sc.thr[triup]))/((nroi*(nroi-1))/2) # edge density of age-invariant network  
+    write.csv(d,paste0(outdf,'/',j,"_density.csv"),row.names=F)    
+    
+    write.csv(sc.thr,paste0(outdf,'/',j,'_bthresh.csv'))
+    setwd(outdf)
+    SC=sc.thr
+    SC[is.na(SC)] <- 0
+    writeMat(paste0(j,"_bthresh.mat"), SC=SC)
+    
+    rm(sc.boot)
+    rm(sc.thr)
+    rm(boot.id)
+    rm(boot.p)
+    rm(boot.p.fdr) 
+    rm(SC)
+}}
+
+```

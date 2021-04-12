@@ -1,0 +1,572 @@
+---
+title: "structural_covariance gams"
+author: "Nandi"
+date: "19 August 2019"
+output: html_document
+---
+
+###LOAD PACKAGES AND SET DIRECTORIES
+```{r, include=FALSE}
+devtools::install_github('gavinsimpson/gratia')
+
+packages <- c("zoo", "tidyr","tibble","stringr","dplyr","ggplot2","parallel","lme4","data.table","RColorBrewer","tidyverse","cluster","factoextra","mgcv","itsadug","psych","parallel","gtools","gridExtra","R.matlab","gratia","ggridges","rowr")
+if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(packages, rownames(installed.packages())))  
+}
+lapply(packages, library, character.only = TRUE)
+
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+scaleFUN <- function(x) sprintf("%.1f", x)
+numcores <- detectCores()
+select <- dplyr::select
+
+dfdir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/nandi/sMRI/age_structcov/age_windows/'
+codedir <- '/Volumes/rds/RDS27534-NICAP/code/sMRI/structcov/'
+parc <- 'HCP'
+windows <- list.files(path = dfdir, pattern = paste0(parc), include.dirs=T,full.names = T, recursive = F)
+
+#load node list
+nodeList <- read.csv(paste0(codedir,'/map_modules/',parc,'_nodes_sc.csv'),header=T)
+nodeList <- setNames(nodeList, c("roiNum","roiName"))
+nodeList$roiNum <- as.factor(nodeList$roiNum)
+nodes=nrow(nodeList)
+
+#load modules
+module = "Yeo"
+if (module == "Yeo") {
+modules <- read.csv(paste0(codedir,'/map_modules/',module,'_',parc,'_regions.csv'),header=T)
+modules <-setNames(modules, c("roiName","modNum")) 
+nmods <- length(unique(modules$modNum))
+} 
+```
+
+#GLOBAL METRICS - Unthresholded
+```{r}
+#change in mean correlation strength
+for (w in 1:length(windows)) {
+  window = windows[w]
+  print(window)
+  
+  #import each bin_?.csv, only use upper half of correlation matrix, and calculate mean correlation strength, and plot change in mean correlation, and plot change in correlation distributions
+  bins <- list.files(path=window,pattern="bin_[1-9]*.csv")
+  data <- lapply(bins,function(x){
+    df <- read.csv(paste0(window,'/',x))
+    age <- mean(df$age)
+    bin <- levels(df$bin)
+    df <- df %>% select(contains("thickness"))
+    df.u <- upper.tri(as.matrix(df),diag=F)
+    df[!df.u] <- NA
+    df <- as.data.frame(df) %>%
+      gather(variable,value) %>%
+      filter(!is.na(value)) %>%
+      mutate(age = age,
+             bin = bin)
+  })
+  data <- rbindlist(data)
+  
+  adf <- data %>% group_by(bin) %>%
+    summarise(value = mean(value),
+              ageMedian = mean(age))
+  
+  modN <- gam(value ~ 1, method = "ML", data=adf)
+  modL <- gam(value ~ ageMedian, method = "ML", data=adf)
+  modS <- gam(value ~ s(ageMedian, k=3), method = "ML", data=adf)
+        
+  pval <- (summary(modL)$p.table)[2,4]
+  outdf <- data.frame(AIC(modN,modL,modS)) %>% rownames_to_column() %>% rename(model = rowname)
+  outdf <- cbind.fill(pval,outdf,fill=NA) %>% rename(pval=object)
+  if (((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[1,4]) < -3)) {
+              model = "modS"
+              ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname)
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+  } else if (((outdf[2,4] - outdf[1,4]) < -3)) {
+              model = "modL"
+              ptable <- as.data.frame(summary(modL)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modL)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname) %>% mutate(edf=NA,Ref.df=NA,`F`=NA,p.value=NA)
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+  } else { 
+              model = "modN"
+              ptable <- as.data.frame(summary(modN)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modN)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname) %>% mutate(edf=NA,Ref.df=NA,`F`=NA,p.value=NA)
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+  }
+  
+  write.csv(outdf, paste0(window,'/mean_correlation_summary_aic.csv'), row.names = F)
+
+  if ( model=="modS" ) {
+    p1 <- ggplot(adf,aes(x=ageMedian,y=value)) +
+      geom_point() + geom_smooth(method = "gam", formula = y ~s(x,k=3)) +
+      theme_minimal(base_size = 24, base_family = "Arial") +
+      theme(axis.line = element_line(colour = "black"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      panel.background = element_blank(),
+      legend.position="none") +
+      ylab("Mean Correlation") +
+      xlab("Age") +
+      scale_y_continuous(labels=scaleFUN,breaks=c(0.20,0.30,0.40,0.50),limits=c(0.20,0.50))
+  } else {
+    p1 <- ggplot(adf,aes(x=ageMedian,y=value)) +
+          geom_point() + geom_smooth(method = "lm") +
+            theme_minimal(base_size = 24, base_family = "Arial") +
+            theme(axis.line = element_line(colour = "black"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.border = element_blank(),
+            panel.background = element_blank(),
+            legend.position="none") +
+            ylab("Mean Correlation") +
+            xlab("Age") +
+            scale_y_continuous(labels=scaleFUN,breaks=c(0.10,0.20,0.30),limits=c(0.04,0.32)) }
+    ggsave(filename=paste0(window,"/mean_correlation_aic.png"), p1, width=5, height=5, units='in', dpi=300)
+
+  adf <- data %>% mutate(ageMedian = as.factor(round(age,1)))
+  p1 <- ggplot(adf,aes(y=ageMedian,x=value)) + 
+    geom_density_ridges2(aes(colour = ageMedian,fill=ageMedian)) +
+    theme_bw() +
+    ylab("Age") + 
+    xlab("Correlation") +
+    theme_minimal(base_size = 24, base_family = "Arial") +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          legend.position="none")
+  
+  ggsave(filename=paste0(window,"/cor_distribution.png"), p1, width=6, height=6, units='in', dpi=300)
+  rm(data,adf,outdf,p1)
+}
+```
+
+#GLOBAL METRICS - Thresholded
+```{r}
+#change in global density
+for (w in 1:length(windows)) {
+  window = windows[w]
+  print(window)
+  density <- read.csv(paste0(window,'/global_density.csv'),header=F)
+  
+  agefile <- gsub(paste0("\\_",parc,".*"),"",window)
+  age <- read.csv(paste0(agefile,'_summary.csv'),header=T)
+  age <- age %>% mutate(variable = paste0("V",agebin))
+
+  adf <- density %>% rownames_to_column() %>%
+    rename(roi = rowname) %>%
+    gather(variable,value,-roi) %>%
+    left_join(.,age,by="variable")
+  
+  modN <- gam(value ~ 1, method = "ML", data=adf)
+  modL <- gam(value ~ ageMedian, method = "ML", data=adf)
+  modS <- gam(value ~ s(ageMedian, k=3), method = "ML", data=adf)
+        
+  pval <- (summary(modL)$p.table)[2,4]
+  outdf <- data.frame(AIC(modN,modL,modS)) %>% rownames_to_column() %>% rename(model = rowname)
+  outdf <- cbind.fill(pval,outdf,fill=NA) %>% rename(pval=object)
+  if (((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[1,4]) < -3)) {
+              model = "modS"
+              ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname)
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+  } else if (((outdf[2,4] - outdf[1,4]) < -3)) {
+              model = "modL"
+              ptable <- as.data.frame(summary(modL)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modL)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname) %>% mutate(edf=NA,Ref.df=NA,`F`=NA,p.value=NA)
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+  } else { 
+              model = "modN"
+              ptable <- as.data.frame(summary(modN)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modN)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname) %>% mutate(edf=NA,Ref.df=NA,`F`=NA,p.value=NA)
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+  }
+  
+  write.csv(outdf, paste0(window,'/global_density_summary_aic.csv'), row.names = F)
+
+  if ( model == "modS" ) {
+      p1 <- ggplot(adf,aes(x=ageMedian,y=value)) +
+        geom_point() + geom_smooth(method = "gam", formula = y ~s(x,k=3)) +
+        theme_minimal(base_size = 24, base_family = "Arial") +
+        theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.position="none") +
+        ylab("Global Density") +
+        xlab("Age") +
+        scale_y_continuous(labels=scaleFUN,breaks=c(0.10,0.20,0.30,0.40),limits=c(0.04,0.40))
+
+  } else {
+        p1 <- ggplot(adf,aes(x=ageMedian,y=value)) +
+          geom_point() + geom_smooth(method = "lm") +
+                  theme_minimal(base_size = 24, base_family = "Arial") +
+          theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          legend.position="none") +
+          ylab("Global Density") +
+          xlab("Age") +
+          scale_y_continuous(labels=scaleFUN,breaks=c(0.10,0.20,0.30,0.40),limits=c(0.04,0.40)) }
+    ggsave(filename=paste0(window,"/global_density_aic.png"), p1, width=5, height=5, units='in', dpi=300) 
+
+  rm(adf,pval,outdf,model,ptable,stable,p1)
+}
+
+#change in (nodal) degree distribution
+for (w in 1:length(windows)) {
+  window = windows[w]
+  print(window)
+  density <- read.csv(paste0(window,'/nodal_degree.csv'),header=F)
+  
+  agefile <- gsub(paste0("\\_",parc,".*"),"",window)
+  age <- read.csv(paste0(agefile,'_summary.csv'),header=T)
+  age <- age %>% mutate(variable = paste0("V",agebin))
+
+  adf <- density %>% rownames_to_column() %>%
+    rename(roi = rowname) %>%
+    gather(variable,value,-roi) %>%
+    left_join(.,age,by="variable") %>%
+    mutate(ageMedian = as.factor(round(ageMedian,1))) %>% arrange(ageMedian)
+  
+  adf2 <- adf %>% group_by(ageMedian) %>% summarise(N=n()) %>%
+    filter(row_number() %% 2 == 0)
+  
+  adf <- adf %>% filter(ageMedian %in% adf2$ageMedian)
+  
+  p1 <- ggplot(adf,aes(y=ageMedian,x=value)) + 
+    geom_density_ridges2(aes(colour = ageMedian,fill=ageMedian)) +
+    theme_bw() +
+    ylab("Age") + 
+    xlab("Degree") +
+    theme_minimal(base_size = 24, base_family = "Arial") +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          legend.position="none")
+
+  ggsave(filename=paste0(window,"/degree_distribution.png"), p1, width=6, height=6, units='in', dpi=300)
+  rm(adf,p1)
+}
+```
+
+#NODAL METRICS - HUBS
+```{r}
+#set up nodes and hubs for plotting in pysurfer
+#model age-related changes in degree of modules
+
+for (w in 1:length(windows)) {
+  
+  window = windows[w]
+  print(window)
+  
+  nodal_files <- list.files(paste0(window),pattern="nodal_degree.csv",full.names=F)
+  nodal_files <- nodal_files[!(grepl("summary", nodal_files))]
+  
+  dir.create(file.path(paste0(window,'/pysurfer')))  
+  
+  for (i in 1:length(nodal_files)) {
+    file = nodal_files[i]
+    print(file)
+    df <- read.csv(paste0(window,'/',file),header=F)
+      
+      #set up plots of raw degree
+      # degree_plots <- lapply(1:length(df),adf=df,FUN=function(x,adf){
+      #   vec <- as.vector(adf[x])
+      #   if (parc == "HCP") {
+      #     v1 <- c(-999,vec[1:180,])
+      #     v2 <- c(-999,vec[181:360,])
+      #   } else if (parc == "DKT") {
+      #     v1 <- c(-999,-999,vec[1:2,],-999,vec[3:29,],-999,-999,vec[30:31,])
+      #     v2 <- c(-999,-999,vec[32:33,],-999,vec[34:60,],-999,-999,vec[61:62,])
+      #   }
+      #   write.table(v1,paste0(window,"/pysurfer/lh_",(gsub(".csv","",file)),"_",x,".csv"),row.names=F,col.names=FALSE)
+      #   write.table(v2,paste0(window,"/pysurfer/rh_",(gsub(".csv","",file)),"_",x,".csv"),row.names=F,col.names=FALSE)
+      # })
+    
+      #scaled plots - hubs alone
+      df_scaled <- as.data.frame(scale(df))
+      df_scaled_hubs <- df_scaled
+      for (j in 1:nrow(df_scaled_hubs)) {
+        if (length(df_scaled_hubs[j,][df_scaled_hubs[j,] > 1.5]) < 2) {
+          df_scaled_hubs[j,] = 0
+        } else { }
+      }
+      
+      # degree_scaled_hubs <- lapply(1:length(df_scaled_hubs),adf=df_scaled_hubs,FUN=function(x,adf){
+      #   vec <- as.vector(adf[x])
+      #   if (parc == "HCP") {
+      #     v1 <- c(-999,vec[1:180,])
+      #     v2 <- c(-999,vec[181:360,])
+      #   } else if (parc == "DKT") {
+      #     v1 <- c(-999,-999,vec[1:2,],-999,vec[3:29,],-999,-999,vec[30:31,])
+      #     v2 <- c(-999,-999,vec[32:33,],-999,vec[34:60,],-999,-999,vec[61:62,])
+      #   }
+      #   write.table(v1,paste0(window,"/pysurfer/lh_",(gsub(".csv","",file)),"_scale_hubs_",x,".csv"),row.names=F,col.names=FALSE)
+      #   write.table(v2,paste0(window,"/pysurfer/rh_",(gsub(".csv","",file)),"_scale_hubs_",x,".csv"),row.names=F,col.names=FALSE)
+      # })
+      
+      #model and plot age-related change for hubs
+      agefile <- gsub(paste0("\\_",parc,".*"),"",window)
+      age <- read.csv(paste0(agefile,'_summary.csv'),header=T)
+      age <- age %>% mutate(variable = paste0("V",agebin))
+      
+      density <- read.csv(paste0(window,'/global_density.csv'),header=F)
+      density <- as.vector(as.numeric(density[1,]))
+      
+      longDF <- df_scaled %>% rownames_to_column() %>%
+        rename(roi = rowname) %>%
+        gather(variable,value,-roi) %>%
+        left_join(.,age,by="variable")
+      
+      models<-lapply(X=as.list(1:nodes), adf=longDF, FUN=function(roiNum, adf) {
+    
+        print(roiNum)
+        roiName<-nodeList[roiNum,2]
+        
+        adf <- adf %>% filter(roi == roiNum)
+        
+        if (length(adf$value[adf$value > 1.5]) > 1) {
+        
+          modN <- gam(value ~ 1, method = "ML", data=adf)
+          modL <- gam(value ~ ageMedian, method = "ML", data=adf)
+          modS <- gam(value ~ s(ageMedian, k=3), method = "ML", data=adf)
+        
+          pval <- (summary(modL)$p.table)[2,4]
+          outdf <- data.frame(AIC(modN,modL,modS)) %>% rownames_to_column() %>% rename(model = rowname) %>% mutate(roiNum=roiNum,roiName=roiName)
+          outdf <- cbind.fill(pval,outdf,fill=NA) %>% rename(pval=object)
+          ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+          stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname)          
+          
+          if (((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[1,4]) < -3)) {
+                      model = "modS"
+                      outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+          } else if ((outdf[2,4] - outdf[1,4]) < -3) {
+                      model = "modL"
+                      outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+          } else { 
+                      model = "modN"
+                      outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+          }
+
+       } else { 
+            
+            outdf <- data.frame(array(NA,dim=c(1,15))) %>% mutate(roiNum=roiNum,roiName=roiName) %>% select(roiNum,roiName,everything())
+            colnames(outdf) <- c("roiNum","roiName","pval","model","df","AIC","object","rowname1","Estimate","Std..Error","t.value","Pr...t..","rowname2","edf","Ref.df","F","p.value")
+       }
+            
+       outdf <- outdf %>% select(roiNum,roiName,everything())
+       outdf
+       })
+      
+      models <- rbindlist(models)
+      models <- models %>% 
+        mutate(pval=as.numeric(as.character(p.value))) %>% 
+        mutate(fdr=p.adjust(pval,method="fdr"))
+      write.csv(models,paste0(window,"/",(gsub(".csv","",file)),"_scale_summary_aic_190321.csv"),row.names=F)
+      rm(models)
+    }
+}
+```
+
+###INTRAMODULE - NORMED
+```{r}
+#NEED TO ADD MODULE LIST
+for (w in 1:length(windows)) {
+  
+  window = windows[w]
+  print(window)
+  
+  #load age for windows
+  agefile <- gsub(paste0("\\_",parc,".*"),"",window)
+  age <- read.csv(paste0(agefile,'_summary.csv'),header=T)
+  age <- age %>% mutate(variable = paste0("V",agebin))
+  
+  #load global density for windows
+  density <- read.csv(paste0(window,'/global_density.csv'),header=F)
+  densityDF <- density %>% gather(variable,glob_den)
+
+  #loop through module files that ARE NOT intermodule 
+  module_files <- "module_intramoduleD_Yeo.csv"
+
+  for (i in 1:length(module_files)) {
+    file = module_files[i]
+    print(file)
+    
+    df <- read.csv(paste0(window,'/',file),header=F)
+    df = df[,seq(0, ncol(df), 3)]
+      ids = paste0('V',as.vector(1:length(df)))
+      df <- setNames(df,ids)
+    
+    longDF <- df %>% rownames_to_column() %>%
+      rename(modNum = rowname) %>%
+      gather(variable,value_orig,-modNum) %>%
+      left_join(.,age,by="variable") %>%
+      left_join(., densityDF) %>%
+      mutate(value = value_orig / glob_den)
+    
+    models<-lapply(X=as.list(1:nmods), adf=longDF, FUN=function(m, adf) {
+      print(m)
+      adf <- adf %>% filter(modNum == m)
+      modN <- gam(value ~ 1, method = "ML", data=adf)
+      modL <- gam(value ~ ageMedian, method = "ML", data=adf)
+      modS <- gam(value ~ s(ageMedian, k=3), method = "ML", data=adf)
+      
+      pval <- (summary(modL)$p.table)[2,4]
+      outdf <- data.frame(AIC(modN,modL,modS)) %>% rownames_to_column() %>% rename(model = rowname) %>% mutate(mod1=m,mod2=m) %>%
+            mutate(modNum = paste0(pmax(mod1,mod2),'_',pmin(mod1,mod2)))
+      outdf <- cbind.fill(pval,outdf,fill=NA) %>% rename(pval=object)
+      if (((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[1,4]) < -3)) {
+                      model = "modS"
+                      ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+                      stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname)
+                      outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+      } else if (((outdf[2,4] - outdf[1,4]) < -3)) {
+                      model = "modL"
+                      ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+                      stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname)
+                      outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+      } else { 
+                      model = "modN"
+                      ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+                      stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname)
+                      outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+      }
+      
+      if ( model == "modS" ) {
+          p1 <- ggplot(adf,aes(x=ageMedian,y=value)) +
+            geom_point() + geom_smooth(method = "gam", formula = y ~s(x,k=3)) 
+        } else {
+          p1 <- ggplot(adf,aes(x=ageMedian,y=value)) +
+            geom_point() + geom_smooth(method = "lm")
+        }
+      #ggsave(filename=paste0(window,"/pysurfer/",(gsub("module_|.csv","",file)),m,"_norm_aic.png"),p1,width=6, height=5, units='in', dpi=300) 
+      outdf <- outdf %>% select(modNum, mod1, mod2, everything())
+    })
+    
+    models <- rbindlist(models,fill=T)     
+    models <- models %>% 
+      mutate(pval=as.numeric(as.character(p.value))) %>%
+      mutate(fdr=p.adjust(pval,method="fdr"))   
+    write.csv(models,paste0(window,"/",(gsub("module_|.csv","",file)),"_norm_summary_aic.csv"),row.names=F)
+    
+    plot <- ggplot(longDF,aes(x=ageMedian,y=value, colour=modNum)) +
+      geom_point() + geom_line() + geom_smooth(method="gam",formula = y ~s(x,k=3)) + 
+      facet_wrap(~modNum) 
+    ggsave(filename=paste0(window,"/",(gsub("module_|.csv","",file)),"_norm_plot_aic.png"),plot,width=15, height=10, units='in', dpi=300)
+  }
+}
+```
+
+###INTERMODULE - NORMED
+```{r}
+for (w in 1:length(windows)) {
+  
+  window = windows[w]
+  print(window)
+  
+  #load age for windows
+  agefile <- gsub(paste0("\\_",parc,".*"),"",window)
+  age <- read.csv(paste0(agefile,'_summary.csv'),header=T)
+  age <- age %>% mutate(variable = paste0("V",agebin))
+  
+  #load global density for windows
+  density <- read.csv(paste0(window,'/global_density.csv'),header=F)
+  densityDF <- density %>% gather(variable,glob_den)
+
+  module_files <- "module_intermoduleD_Yeo.csv"
+  
+  for (i in 1:length(module_files)) {
+    file = module_files[i]
+    print(file)
+    df <- read.csv(paste0(window,'/',file),header=F)
+    df <- df[,seq(0, ncol(df), 3)]
+    
+    models_out <- data.frame(matrix(vector(), 0, 19))
+    models_out <- setNames(models_out, c("pval","modNum","mod1","mod2","model","df","AIC",
+                                           "object","rowname1","Estimate","Std..Error",
+                                           "t.value","Pr...t..","rowname2","edf","Ref.df","F","p.value","fdr"))
+    
+    for (m1 in 1:nmods) {
+      
+      df2 <- df[,seq(m1, ncol(df), 7)]
+      ids = paste0('V',as.vector(1:length(df2)))
+      df2 <- setNames(df2,ids)
+      
+      longDF <- df2 %>% rownames_to_column() %>%
+        rename(modNum = rowname) %>%
+        gather(variable,value_orig,-modNum) %>%
+        left_join(.,age,by="variable") %>%
+        filter(!modNum==m1) %>%
+        left_join(., densityDF) %>%
+        mutate(value = value_orig / glob_den)
+      
+      list <- as.list(unique(longDF$modNum)) 
+      models<-lapply(X=list, adf=longDF, FUN=function(m2, adf) {
+        
+          adf <- adf %>% filter(modNum == m2)
+          modN <- gam(value ~ 1, method = "ML", data=adf)
+          modL <- gam(value ~ ageMedian, method = "ML", data=adf)
+          modS <- gam(value ~ s(ageMedian, k=3), method = "ML", data=adf)
+        
+          pval <- (summary(modL)$p.table)[2,4]
+          outdf <- data.frame(AIC(modN,modL,modS)) %>% rownames_to_column() %>% rename(model = rowname) %>% mutate(mod1 = m1, mod2 = m2) %>%
+            mutate(modNum = paste0(pmax(mod1,mod2),'_',pmin(mod1,mod2)))
+          outdf <- cbind.fill(pval,outdf,fill=NA) %>% rename(pval=object)
+          
+          if (((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[2,4]) < -3) & ((outdf[3,4] - outdf[1,4]) < -3)) {
+              model = "modS"
+              ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname)
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+          } else if (((outdf[2,4] - outdf[1,4]) < -3)) {
+              model = "modL"
+              ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname) 
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+          } else { 
+              model = "modN"
+              ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column() %>% rename(rowname1=rowname)
+              stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column() %>% rename(rowname2=rowname) 
+              outdf <- cbind.fill(outdf,model,ptable,stable,fill=NA)
+          } 
+
+          if ( model == "modS" ) {
+                p1 <- ggplot(adf,aes(x=ageMedian,y=value)) +
+                  geom_point() + geom_smooth(method = "gam", formula = y ~s(x,k=3)) 
+          } else {
+                p1 <- ggplot(adf,aes(x=ageMedian,y=value)) +
+                  geom_point() + geom_smooth(method = "lm")
+          }
+          #ggsave(filename=paste0(window,"/pysurfer/",(gsub("module_|.csv","",file)),m1,"_",m2,"_norm_aic.png"),p1,width=6, height=5, units='in', dpi=300)
+        
+        outdf <- outdf %>%  select(modNum, mod1, mod2, everything())
+      })
+        
+      models <- rbindlist(models,fill=T)
+      models_out <- rbind(models_out,models,fill=T)
+      
+      plot <- ggplot(longDF,aes(x=ageMedian,y=value, colour=modNum)) +
+        geom_point() + geom_line() + geom_smooth(method="gam",formula = y ~s(x,k=3)) + 
+        facet_wrap(~modNum) 
+      #ggsave(filename=paste0(window,"/",(gsub("module_|.csv","",file)),m1,"_norm_plot_aic.png"),plot,width=15, height=10, units='in', dpi=300)
+    
+      rm(models,longDF) }
+  
+  models_out <- models_out %>% select(-mod1,-mod2)
+  models_out <- models_out[!duplicated(models_out),]
+  models_out <- models_out %>% 
+    mutate(pval=as.numeric(as.character(p.value))) %>% 
+    mutate(fdr=p.adjust(pval,method="fdr"))
+  
+  write.csv(models_out,paste0(window,"/",(gsub("module_|.csv","",file)),"_norm_summary_aic.csv"),row.names=F) }}
+```
